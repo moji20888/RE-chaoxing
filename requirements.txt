@@ -1,0 +1,14 @@
+requests
+pyaes
+beautifulsoup4
+lxml
+argparse
+loguru
+celery
+flask
+fonttools
+selenium
+webdriver-manager
+playwright
+win10toast
+ddddocr
