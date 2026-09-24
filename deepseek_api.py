@@ -1,6 +1,39 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import requests
 from api.logger import logger
+
+
+# ==================== 按题型精简的提示词（v3.5） ====================
+# 题目是一题一题发过去的，所以只发当前题型的那一句规则即可，省 token 也更不容易跑偏。
+SYSTEM_PROMPTS = {
+    "single": "你是答题助手。这是单选题，只输出正确选项的字母（如 A），不要解释、不要标点。",
+    "multiple": "你是答题助手。这是多选题，只输出所有正确选项的字母、按字母顺序连写（如 ABD），不要解释。",
+    "judgement": "你是答题助手。这是判断题，只输出对或错，不要任何其他文字。",
+    "completion": "你是答题助手。这是填空题，只输出填空内容；多个空用逗号分隔，不要标点、不要解释。",
+    "short": "你是答题助手。这是简答题，直接给出核心答案（不超过50字），不要解释、不要标点。",
+}
+SYSTEM_PROMPT_DEFAULT = "你是答题助手。只输出答案本身，不要解释、不要 Markdown、不要答案是：这类前缀。"
+
+# 题型别名：中文/英文写法都认
+PROMPT_ALIAS = {
+    "单选题": "single", "单选": "single", "single": "single", "radio": "single",
+    "多选题": "multiple", "多选": "multiple", "multiple": "multiple", "checkbox": "multiple",
+    "判断题": "judgement", "判断": "judgement", "judgement": "judgement",
+    "judgment": "judgement", "truefalse": "judgement",
+    "填空题": "completion", "填空": "completion", "completion": "completion", "fill": "completion",
+    "简答题": "short", "简答": "short", "short": "short", "essay": "short", "问答": "short",
+}
+
+
+def pick_system_prompt(question_type) -> str:
+    """按题型挑一段尽量短的提示词（认不出来就用通用的一句）"""
+    _t = str(question_type or "").strip().lower()
+    if _t in PROMPT_ALIAS:
+        return SYSTEM_PROMPTS[PROMPT_ALIAS[_t]]
+    for _key, _name in PROMPT_ALIAS.items():
+        if _key in _t:
+            return SYSTEM_PROMPTS[_name]
+    return SYSTEM_PROMPT_DEFAULT
 
 
 class DeepSeekAnswer:
@@ -61,22 +94,8 @@ class DeepSeekAnswer:
             question_type = question_data.get('type', '未知题型')
             question_text += f"\n题型：{question_type}"
 
-            system_prompt = """你是一个专业的答题助手，负责根据题目内容和选项给出准确的答案。
-
-回答规则如下：
-1. 单选题：只返回一个选项字母，例如 A、B、C、D。
-2. 多选题：返回所有正确选项的字母，按字母顺序排列，例如 AB、ACD，不要只返回单个字母。
-3. 判断题：只返回"对"或"错"，不要返回其他内容。
-4. 填空题：直接给出填空内容，不要加任何标点和解释。如果有多个空，用逗号分隔。
-5. 简答题：直接给出核心答案，不超过50字，不要解释和标点。
-
-输出要求：
-- 只输出答案本身，不要输出任何解释、说明、前缀或后缀。
-- 不要使用 Markdown 语法。
-- 不要输出题号或题型。
-- 不要输出"答案："这样的字样。
-
-"""
+            # v3.5：只发当前题型的那一句规则，省 token
+            system_prompt = pick_system_prompt(question_type)
 
             payload = {
                 "model": self.model,

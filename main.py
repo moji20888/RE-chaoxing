@@ -18,7 +18,7 @@ from api.logger import logger
 from api.base import Chaoxing, Account
 from api.exceptions import LoginError, FormatError, JSONDecodeError, MaxRollBackError
 from api.cookies import use_cookies, read_credentials, write_credentials
-from api.config import GlobalConst as gc
+from api.config import GlobalConst as gc, pick_wait, parse_wait_spec, wait_spec_text
 from api.live import Live
 from api.live_process import LiveProcessor
 from deepseek_api import DeepSeekAnswer
@@ -167,17 +167,35 @@ API_KEY_FILE = "api_key.json"
 SETTINGS_FILE = "settings.json"
 
 
+def input_wait_spec(text, default_fixed: float = 5.0, min_fixed: int = 1):
+    """把用户在菜单里输入的固定秒数 / 范围转成设置值：
+       数字 -> int（固定），"3-8" -> 字符串（每次随机）。返回 None 表示没输入。"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if ("-" in text) or ("~" in text) or ("至" in text):
+        low, high = parse_wait_spec(text, default_fixed)
+        if high <= 0:
+            raise ValueError("range must be positive")
+        return ("%g-%g" % (low, high)) if (low != int(low) or high != int(high)) else ("%d-%d" % (int(low), int(high)))
+    value = max(min_fixed, int(float(text)))
+    return value
+
+
 def load_settings():
     default = {
         "enable_thinking": False,
         "locked_chapter_policy": "auto",   # 未开放(闯关)章节处理策略: auto / skip / rollback
         "locked_retry_times": 2,           # 未开放章节重试次数
-        "locked_retry_interval": 5,        # 未开放章节重试间隔(秒)
+        "locked_retry_interval": "3-8",    # 未开放章节重试间隔：固定秒数，或范围如 "3-8"（建议 3-8）
         "locked_second_pass_rounds": 5,    # 收尾复查轮数（0 = 关闭）
         "max_rollback_times": 3,           # 同一章节最多回滚次数
         "unlock_check_times": 4,           # 访问章节后，等待/复查下一章解锁的次数
-        "unlock_check_interval": 5,        # 每次复查的间隔（秒）
-        "sweep_wait_seconds": 180,         # 收尾复查每轮之间等待的秒数（等服务端解锁/判定）
+        "unlock_check_interval": "3-8",    # 每次复查的间隔：固定秒数，或范围如 "3-8"（建议 3-8）
+        "sweep_wait_seconds": "120-300",   # 收尾复查每轮间隔：固定秒数，或范围如 "120-300"（建议 2~5 分钟）
+        "video_end_retry_times": 3,        # 视频到 100% 后、等服务端判定的重试次数
+        "video_end_retry_interval": "3-8", # 视频重试间隔：固定秒数，或范围如 "3-8"（建议 3-8）
+        "video_fast_finish": False,        # 是否先试已看完上报（原版 isdrag=4 做法，更激进，默认关）
     }
     if not os.path.exists(SETTINGS_FILE):
         return default
@@ -386,14 +404,15 @@ def decide_not_open_action(point, prev_jobs_count, policy, rollback_times, max_r
     return "skip", reason + "（上一章任务点已刷完，回滚也无法解锁）"
 
 
-def fetch_job_list(chaoxing, course, knowledgeid, title="", retry_times=0, retry_interval=5.0):
-    """读取章节任务点；章节未开放时按需等待重试"""
+def fetch_job_list(chaoxing, course, knowledgeid, title="", retry_times=0, retry_interval="3-8"):
+    """读取章节任务点；章节未开放时按需等待重试（间隔支持固定秒数或 "3-8" 这种范围）"""
     jobs, job_info = chaoxing.get_job_list(course["clazzId"], course["courseId"], course["cpi"], knowledgeid)
     attempt = 0
     while job_info.get("notOpen") and attempt < retry_times:
         attempt += 1
-        logger.warning(f"章节《{title}》未开放，{retry_interval:g} 秒后重试（{attempt}/{retry_times}）...")
-        if sleep_interruptible(retry_interval):
+        _wait = pick_wait(retry_interval, 5.0)
+        logger.warning(f"章节《{title}》未开放，{_wait:.1f} 秒后重试（{attempt}/{retry_times}）...")
+        if sleep_interruptible(_wait):
             break
         jobs, job_info = chaoxing.get_job_list(course["clazzId"], course["courseId"], course["cpi"], knowledgeid)
     return jobs, job_info
@@ -477,7 +496,7 @@ def wait_chapter_unlock(chaoxing, course, points, index, times, interval):
     point = points[index]
     times = max(1, int(times))
     for attempt in range(1, times + 1):
-        if sleep_interruptible(interval):
+        if sleep_interruptible(pick_wait(interval, 5.0)):
             return False
         logger.info(f"等待《{point['title']}》解锁，第 {attempt}/{times} 次重读章节状态...")
         refresh_course_states(chaoxing, course, points)
@@ -502,11 +521,11 @@ def study_course(chaoxing, course, deepseek_tiku, settings):
     """刷一门课的所有章节：自动跳过未开放(闯关)章节，返回被跳过的章节列表"""
     policy = settings.get("locked_chapter_policy", LOCKED_POLICY_AUTO)
     retry_times = int(settings.get("locked_retry_times", 2))
-    retry_interval = float(settings.get("locked_retry_interval", 5))
+    retry_interval = settings.get("locked_retry_interval", "3-8")
     second_pass_rounds = int(settings.get("locked_second_pass_rounds", 3))
     unlock_check_times = int(settings.get("unlock_check_times", 4))
-    unlock_check_interval = float(settings.get("unlock_check_interval", 5))
-    sweep_wait_seconds = float(settings.get("sweep_wait_seconds", 180))
+    unlock_check_interval = settings.get("unlock_check_interval", "3-8")
+    sweep_wait_seconds = settings.get("sweep_wait_seconds", "120-300")
     max_rollback = int(settings.get("max_rollback_times", 3))
 
     point_list = chaoxing.get_course_point(course["courseId"], course["clazzId"], course["cpi"])
@@ -654,7 +673,7 @@ def study_course(chaoxing, course, deepseek_tiku, settings):
             break
         # 还有已解锁但没完成的章节：多半是服务端还没判定（例如视频卡在 100%）。
         # 隔一段时间自己复查，一旦解锁/判定生效就接着刷，不用手动重启脚本。
-        _wait = max(5.0, sweep_wait_seconds)
+        _wait = max(5.0, pick_wait(sweep_wait_seconds, 180.0))
         logger.info(f"第 {_round} 轮复查结束，{_wait:g} 秒后再复查一次"
                     f"（超星解锁/判定有时比较慢，等它一下即可；按 Ctrl+C 可随时停止）...")
         if sleep_interruptible(_wait):
@@ -723,6 +742,10 @@ def run_with_courses(course_task, username, password, api_key, enable_thinking=F
         deepseek_tiku = DeepSeekAnswer(api_key=api_key, enable_thinking=enable_thinking)
         deepseek_tiku.init_tiku()
         chaoxing = Chaoxing(account=account, tiku=deepseek_tiku, browser_context=browser_context)
+        # v3.6：视频上报节奏（菜单「5  6/7」或 settings.json 里改）
+        chaoxing.video_end_retry_times = int(settings.get("video_end_retry_times", 3))
+        chaoxing.video_end_retry_interval = settings.get("video_end_retry_interval", "3-8")
+        chaoxing.video_fast_finish = bool(settings.get("video_fast_finish", False))
 
         _login_state = chaoxing.login(login_with_cookies=True)
         if not _login_state["status"]:
@@ -867,14 +890,17 @@ def manage_locked_settings(settings):
     while True:
         if _stop_requested.is_set():
             return settings
-        choice = draw_screen(msg=msg, title="未开放(闯关)章节处理设置",
+        choice = draw_screen(msg=msg, title="刷课策略与节奏设置（闯关处理 / 等待与复查 / 视频上报）",
                              lines=["说明: 闯关模式下，上一章的闯关任务点没刷完，下一章会显示「章节未开放」。",
+                                    "      里面所有间隔都能填【固定秒数】如 5，或【范围】如 3-8（范围就是每次随机取值）。",
                                     f"1. 处理策略: {LOCKED_POLICY_NAME.get(settings.get('locked_chapter_policy'), '自动判断')}",
-                                    f"2. 未开放重试: {settings.get('locked_retry_times', 2)} 次，间隔 {settings.get('locked_retry_interval', 5)} 秒",
-                                    f"3. 收尾复查: {settings.get('locked_second_pass_rounds', 3)} 轮，每轮间隔 {settings.get('sweep_wait_seconds', 180)} 秒（轮数 0 = 关闭）",
+                                    f"2. 未开放重试: {settings.get('locked_retry_times', 2)} 次，间隔 {wait_spec_text(settings.get('locked_retry_interval', '3-8'))} 秒（建议 3-8）",
+                                    f"3. 收尾复查: {settings.get('locked_second_pass_rounds', 5)} 轮，每轮间隔 {wait_spec_text(settings.get('sweep_wait_seconds', '120-300'))} 秒（轮数 0 = 关闭，建议 120-300）",
                                     f"4. 同一章节最多回滚次数: {settings.get('max_rollback_times', 3)}",
-                                    f"5. 解锁等待: 最多等 {settings.get('unlock_check_times', 4)} 次  {settings.get('unlock_check_interval', 5)} 秒",
-                                    "6. 返回主菜单"])
+                                    f"5. 解锁等待: 最多 {settings.get('unlock_check_times', 4)} 次，间隔 {wait_spec_text(settings.get('unlock_check_interval', '3-8'))} 秒（建议 3-8）",
+                                    f"6. 视频卡100%重试: {settings.get('video_end_retry_times', 3)} 次，间隔 {wait_spec_text(settings.get('video_end_retry_interval', '3-8'))} 秒（建议 3-8）",
+                                    f"7. 先试已看完上报(原版做法，更激进): {'开启' if settings.get('video_fast_finish') else '关闭'}",
+                                    "8. 返回主菜单"])
         msg = ""
         if choice is None:
             return settings
@@ -892,27 +918,31 @@ def manage_locked_settings(settings):
         elif choice == '2':
             try:
                 times = input(f"重试次数（当前 {settings.get('locked_retry_times', 2)}）: ").strip()
-                interval = input(f"重试间隔秒数（当前 {settings.get('locked_retry_interval', 5)}）: ").strip()
+                interval = input(f"重试间隔（当前 {wait_spec_text(settings.get('locked_retry_interval', '3-8'))} 秒；"
+                                 f"可填固定秒数如 5，或范围如 3-8，建议 3-8）: ").strip()
                 if times:
                     settings['locked_retry_times'] = max(0, int(times))
-                if interval:
-                    settings['locked_retry_interval'] = max(1, int(interval))
+                spec = input_wait_spec(interval, 5.0)
+                if spec is not None:
+                    settings['locked_retry_interval'] = spec
                 save_settings(settings)
                 msg = "已保存。"
             except ValueError:
-                msg = "输入的不是数字，已取消。"
+                msg = "输入不是数字/范围，已取消。"
         elif choice == '3':
             try:
-                num = input(f"收尾复查轮数（0 = 关闭，当前 {settings.get('locked_second_pass_rounds', 3)}）: ").strip()
-                gap = input(f"每轮之间等待秒数（当前 {settings.get('sweep_wait_seconds', 180)}）: ").strip()
+                num = input(f"收尾复查轮数（0 = 关闭，当前 {settings.get('locked_second_pass_rounds', 5)}）: ").strip()
+                gap = input(f"每轮间隔（当前 {wait_spec_text(settings.get('sweep_wait_seconds', '120-300'))} 秒；"
+                            f"可填固定秒数或范围，建议 120-300）: ").strip()
                 if num:
                     settings['locked_second_pass_rounds'] = max(0, int(num))
-                if gap:
-                    settings['sweep_wait_seconds'] = max(0, int(gap))
+                spec = input_wait_spec(gap, 180.0, 0)
+                if spec is not None:
+                    settings['sweep_wait_seconds'] = spec
                 save_settings(settings)
                 msg = "已保存。"
             except ValueError:
-                msg = "输入的不是数字，已取消。"
+                msg = "输入不是数字/范围，已取消。"
         elif choice == '4':
             try:
                 num = input(f"最多回滚次数（当前 {settings.get('max_rollback_times', 3)}）: ").strip()
@@ -925,16 +955,37 @@ def manage_locked_settings(settings):
         elif choice == '5':
             try:
                 times = input(f"等待次数（当前 {settings.get('unlock_check_times', 4)}）: ").strip()
-                interval = input(f"每次间隔秒数（当前 {settings.get('unlock_check_interval', 5)}）: ").strip()
+                interval = input(f"每次间隔（当前 {wait_spec_text(settings.get('unlock_check_interval', '3-8'))} 秒；"
+                                 f"可填固定秒数或范围，建议 3-8）: ").strip()
                 if times:
                     settings['unlock_check_times'] = max(1, int(times))
-                if interval:
-                    settings['unlock_check_interval'] = max(1, int(interval))
+                spec = input_wait_spec(interval, 5.0)
+                if spec is not None:
+                    settings['unlock_check_interval'] = spec
                 save_settings(settings)
                 msg = "已保存。"
             except ValueError:
-                msg = "输入的不是数字，已取消。"
+                msg = "输入不是数字/范围，已取消。"
         elif choice == '6':
+            try:
+                times = input(f"重试次数（当前 {settings.get('video_end_retry_times', 3)}，0 = 不等直接跳过）: ").strip()
+                interval = input(f"重试间隔（当前 {wait_spec_text(settings.get('video_end_retry_interval', '3-8'))} 秒；"
+                                 f"可填固定秒数或范围，建议 3-8）: ").strip()
+                if times:
+                    settings['video_end_retry_times'] = max(0, int(times))
+                spec = input_wait_spec(interval, 5.0)
+                if spec is not None:
+                    settings['video_end_retry_interval'] = spec
+                save_settings(settings)
+                msg = "已保存。"
+            except ValueError:
+                msg = "输入不是数字/范围，已取消。"
+        elif choice == '7':
+            settings['video_fast_finish'] = not settings.get('video_fast_finish', False)
+            save_settings(settings)
+            msg = ("已开启：视频会先上报一次已看完(isdrag=4)，能过的会秒过；"
+                   "但从风控角度看比模拟正常播放更突兀。") if settings['video_fast_finish'] else "已关闭。"
+        elif choice == '8':
             return settings
         else:
             msg = "无效输入"
@@ -995,7 +1046,7 @@ def main():
             print("\n已退出。")
             break
 
-        _lines = ["", "=" * 40, "超星学习通自动刷课脚本 v3.5",
+        _lines = ["", "=" * 40, "超星学习通自动刷课脚本 v3.6",
                   "提示: 退出请按 Ctrl+C（不要点窗口 X 按钮）", "=" * 40,
                   "1. 开始刷课"]
         if saved_user:
@@ -1003,7 +1054,7 @@ def main():
         _lines += ["2. 管理API密钥",
                    "3. 管理保存账号",
                    f"4. 深度思考模式: {'[开启]' if settings['enable_thinking'] else '[关闭]'}",
-                   f"5. 未开放(闯关)章节处理: [{LOCKED_POLICY_NAME.get(settings.get('locked_chapter_policy'), '自动判断')}]",
+                   f"5. 刷课策略与节奏设置: [{LOCKED_POLICY_NAME.get(settings.get('locked_chapter_policy'), '自动判断')}]",
                    "6. 退出"]
         choice = draw_screen(msg=notice, lines=_lines, do_clear=need_clear)
         notice = ""

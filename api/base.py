@@ -17,7 +17,7 @@ from api.cipher import AESCipher
 from api.logger import logger
 from api.cookies import save_cookies, use_cookies
 from api.process import update_progress, finish_progress
-from api.config import GlobalConst as gc
+from api.config import GlobalConst as gc, pick_wait
 from api.decode import (
     decode_course_list,
     decode_course_point,
@@ -589,6 +589,7 @@ class Chaoxing:
         _playingTime,
         _type: str = "Video",
         headers: Optional[dict] = None,
+        _isdrag: int = 3,
     ) -> tuple[bool, int]:
         if headers is None:
             headers = gc.VIDEO_HEADERS if _type == "Video" else gc.AUDIO_HEADERS
@@ -605,7 +606,7 @@ class Chaoxing:
             "courseId": _course["courseId"],
             "jobid": _job["jobid"],
             "userid": self.get_uid(),
-            "isdrag": "3",
+            "isdrag": str(_isdrag),
             "view": "pc",
             "enc": self.get_enc(_course["clazzId"], _job["jobid"], _job["objectid"], _playingTime, _duration, self.get_uid()),
             "dtype": _type,
@@ -719,21 +720,36 @@ class Chaoxing:
 
         logger.info(f"开始任务: {_job['name']}, 总时长: {duration}s, 已进行: {play_time}s")
 
-        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, play_time, _type, headers)
+        # v3.6（可选，默认关闭）：先按原版做法试一次已看完上报
+        # （playingTime=总时长 + isdrag=4）。有些视频服务端记录了进度却迟迟不判完成，
+        # 这一下可能直接判过；但它等于一步上报 100%，比模拟正常播放突兀，风控角度更激进。
+        if getattr(self, "video_fast_finish", False):
+            try:
+                _fast_passed, _fast_state = self.video_progress_log(
+                    _session, _course, _job, _job_info, _dtoken, duration, duration, _type, headers, _isdrag=4)
+            except TypeError:
+                _fast_passed, _fast_state = False, 0
+            if _fast_passed:
+                logger.info(f"任务瞬间完成(isdrag=4): {_job['name']}")
+                finish_progress()
+                return StudyResult.SUCCESS
+            logger.debug(f"已看完上报未被判定完成(state={_fast_state})，继续按正常流程播放")
+
+        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, play_time, _type, headers=headers)
         if passed:
             logger.info(f"任务瞬间完成: {_job['name']}")
             return StudyResult.SUCCESS
 
-        # v3.5：进度已经 100%、但服务端一直不返回 isPassed 时，不许无限循环
-        end_retry = 0                 # 已播完但未判定完成的重复上报次数
-        max_end_retry = 6             # 最多再上报 6 次
-        end_retry_interval = 5        # 每次间隔 5 秒（旧版是每 0.1 秒狂发一次）
+        # v3.6：进度已经 100%、但服务端一直不返回 isPassed 时，不许无限循环。
+        # 次数可配置（默认 3 次），间隔用随机 3~8 秒  避免每 5 秒一次这种机械节奏。
+        end_retry = 0
+        max_end_retry = max(0, int(getattr(self, "video_end_retry_times", 3)))
 
         while not passed:
             if play_time - last_log_time >= wait_time or play_time >= duration:
                 passed, state = self.video_progress_log(
                     _session, _course, _job, _job_info, _dtoken, duration,
-                    int(play_time), _type, headers
+                    int(play_time), _type, headers=headers
                 )
 
                 if state == 403:
@@ -776,8 +792,10 @@ class Chaoxing:
                         logger.warning("  提示：如果网页上也显示这个视频没学完，建议在浏览器里正常播放完一遍（不要拖动进度条），再重跑脚本")
                         finish_progress()
                         return StudyResult.TIMEOUT
-                    logger.warning(f"任务《{_job['name']}》已到 100%，等待服务端确认（第 {end_retry}/{max_end_retry} 次）...")
-                    time.sleep(end_retry_interval)
+                    _wait_s = pick_wait(getattr(self, "video_end_retry_interval", "3-8"), 5.0)
+                    logger.warning(f"任务《{_job['name']}》已到 100%，等待服务端确认"
+                                   f"（第 {end_retry}/{max_end_retry} 次，{_wait_s:.0f} 秒后再上报）...")
+                    time.sleep(_wait_s)
 
                 wait_time = random.randint(30, 90)
                 last_log_time = play_time
