@@ -472,7 +472,13 @@ class Chaoxing:
                 logger.info("该章节未开放")
                 return [], _job_info
             job_list += _job_list
-            job_info.update(_job_info)
+            # 章节 id 以请求参数为准（cards 接口的 defaults 有时不带 knowledgeid）
+            if _knowledgeid and not _job_info.get("knowledgeid"):
+                _job_info["knowledgeid"] = str(_knowledgeid)
+            # 只覆盖“有新值”的字段：某一次请求缺字段时不要把前一次的好值冲成 None
+            for _k, _v in _job_info.items():
+                if _v is not None or _k not in job_info:
+                    job_info[_k] = _v
         logger.info("章节任务点读取成功...")
         return job_list, job_info
 
@@ -1149,42 +1155,294 @@ class Chaoxing:
             raise RuntimeError(f"提交失败，HTTP {res.status_code}")
 
     # ==================== 阅读 ====================
-    def study_read(self, _course, _job, _job_info) -> StudyResult:
-        """阅读任务"""
-        _session = SessionManager.get_session()
-        jobid = str(_job.get('jobid', '')).replace("read-", "")
-        knowledgeid = _job_info.get("knowledgeid")
+    # 【v3.7 修复】阅读任务点（图书/资料）是这块代码里的坑，两个问题：
+    #   1) 卡片解析：以前只处理"没有 job 字段"的 read 卡片。如果一个章节里
+    #      "多段视频 + 一项阅读"混在一起，那张阅读卡片往往带 job 字段，会被
+    #      当成非任务点直接丢掉 —— 脚本根本看不见这个任务点，章节就一直显示
+    #      未完成，收尾复查反复卡在这一章（这就是本次要修的根因）。
+    #   2) 上报参数：阅读接口的必需参数各章节写法不一致（jobid 有 "read-206976146"
+    #      和纯数字两种），而且返回 HTTP 200 也不代表完成（可能是"无效的请求参数"）。
+    #      所以这里把几种写法都试一遍，并且真正解析返回内容；接口都不行时，
+    #      用浏览器点开这个阅读任务，让网页前端自己去上报（纯阅读章节"点开就完成"
+    #      就是这个道理）。
+    @staticmethod
+    def _read_knowledgeid_candidates(_job, _job_info):
+        """阅读任务可能用到的章节 id：任务点接口给的优先，其次是卡片 otherInfo 里的 nodeId"""
+        _cands = []
+        _val = (_job_info or {}).get("knowledgeid")
+        if _val not in (None, ""):
+            _cands.append(str(_val))
+        _match = re.findall(r"nodeId_([^\-&]+)", (_job or {}).get("otherinfo") or "")
+        if _match and _match[0] not in _cands:
+            _cands.append(_match[0])
+        return _cands
 
-        _url = "https://mooc1.chaoxing.com/ananas/job/readv2"
-        params = {
-            'jobid': jobid,
-            'knowledgeid': knowledgeid,
-            'jtoken': _job.get('jtoken', ''),
-            'courseid': _course['courseId'],
-            'clazzid': _course['clazzId'],
-            '_dc': get_timestamp()
-        }
+    @staticmethod
+    def _read_jobid_candidates(_job):
+        """阅读任务点的 jobid 写法：卡片原值（常见 read-206976146）和纯数字都要试"""
+        _cands = []
+        for _key in ("jobid", "readid", "id", "objectid"):
+            _val = (_job or {}).get(_key)
+            if _val in (None, "", "0"):
+                continue
+            _val = str(_val)
+            _pure = _val.replace("read-", "").strip()
+            for _v in (_val, _pure, ("read-%s" % _pure) if _pure else ""):
+                if _v and _v not in _cands:
+                    _cands.append(_v)
+        return _cands
 
-        logger.info(f"正在完成阅读任务: {_job.get('title')} | jobid={jobid}")
+    @staticmethod
+    def _read_jtoken(_job, _job_info):
+        for _val in ((_job or {}).get("jtoken"), (_job or {}).get("ktoken"), (_job_info or {}).get("ktoken")):
+            if _val not in (None, ""):
+                return _val
+        return ""
+
+    @staticmethod
+    def _read_judge(_resp):
+        """判断阅读接口的返回：(是否完成, 服务端消息)。HTTP 200 也可能是"无效的请求参数"。"""
+        if _resp is None:
+            return False, "无响应"
+        if _resp.status_code != 200:
+            return False, "HTTP %s" % _resp.status_code
+        _text = (_resp.text or "").strip()
+        _msg = _text[:200]
+        _status = None
         try:
-            _resp = _session.get(_url, params=params, timeout=10)
-            if _resp.status_code == 200:
-                try:
-                    msg = _resp.json().get('msg', '完成')
-                    logger.info(f"阅读任务学习 -> {msg}")
-                except Exception:
-                    logger.info("阅读任务学习 -> 完成")
-                return StudyResult.SUCCESS
-            logger.error(f"阅读任务失败: {_resp.status_code}")
-            return StudyResult.ERROR
+            _data = _resp.json()
+            if isinstance(_data, dict):
+                _msg = str(_data.get("msg") or _data.get("message") or _data.get("error") or _text)[:200]
+                _status = _data.get("status")
+        except Exception:
+            pass
+        _bad = re.search(r"无效|失败|错误|不合法|非法|拒绝|invalid|error|exception", _msg, re.I)
+        _good = re.search(r"成功|已完成|完成|已读|ok|success", _msg, re.I)
+        _ok = False
+        if _status is True or str(_status).lower() in ("true", "1", "success"):
+            _ok = True
+        elif _good and not _bad:
+            _ok = True
+        if _bad:
+            _ok = False
+        return _ok, _msg
+
+    def _read_marked_passed(self, _course, _job, _job_info) -> bool:
+        """任务点接口只返回还没完成的卡片：这个阅读任务不在里面了，说明服务端已经判定完成"""
+        _kids = self._read_knowledgeid_candidates(_job, _job_info)
+        if not _kids:
+            return False
+        _keys = {str(_v).replace("read-", "") for _v
+                 in (_job.get("jobid"), _job.get("readid"), _job.get("id")) if _v not in (None, "")}
+        if not _keys:
+            return False
+        try:
+            _jobs, _info = self.get_job_list(_course["clazzId"], _course["courseId"], _course["cpi"], _kids[0])
         except Exception as e:
-            logger.error(f"阅读任务异常: {e}")
+            logger.debug(f"复查阅读任务状态失败: {e}")
+            return False
+        if _info.get("notOpen"):
+            return False
+        if not _info:
+            # 接口没返回有效数据（网络抖动/token 失效），不能当成"已完成"
+            return False
+        for _j in _jobs:
+            if str(_j.get("type")) != "read":
+                continue
+            _jkeys = {str(_v).replace("read-", "") for _v
+                      in (_j.get("jobid"), _j.get("readid"), _j.get("id")) if _v not in (None, "")}
+            if _jkeys & _keys:
+                return False
+        return True
+    def _sync_cookies_to_browser(self):
+        """把 requests 会话里的 cookies 同步给浏览器，保证浏览器打开页面时是登录状态"""
+        if self.browser_context is None:
+            return
+        try:
+            _session = SessionManager.get_session()
+            _cookies = []
+            for _c in _session.cookies:
+                if not _c.name:
+                    continue
+                _domain = _c.domain or ".chaoxing.com"
+                if "chaoxing" not in _domain:
+                    continue
+                if not _domain.startswith("."):
+                    _domain = "." + _domain.lstrip(".")
+                _cookies.append({"name": _c.name, "value": _c.value or "",
+                                 "domain": _domain, "path": _c.path or "/"})
+            if _cookies:
+                self.browser_context.add_cookies(_cookies)
+        except Exception as e:
+            logger.debug(f"同步 cookies 到浏览器失败: {e}")
+
+    def _read_open_in_browser(self, _course, _job, _job_info) -> bool:
+        """兜底：像网页那样点开这一章的阅读任务（点"去阅读"就会触发 readv2 上报）
+
+        注意：不能在浏览器里直接打开 studentstudy 页面 —— 那个页面需要 URL 里的 enc，
+        脚本没有，只会拿到"enc校验失败"。但 knowledge/cards 页面不需要 enc，
+        而且阅读任务模块（/ananas/modules/read/indexV2.html -> readv2job/preview）
+        就嵌在里面，点它上面的"去阅读"等价于 finishJob()。
+        """
+        if self.browser_context is None:
+            return False
+        _kids = self._read_knowledgeid_candidates(_job, _job_info)
+        if not _kids:
+            return False
+        _captured = []
+        _page = None
+        try:
+            _before_ids = {id(_p) for _p in self.browser_context.pages}
+        except Exception:
+            _before_ids = set()
+
+        def _on_request(_req):
+            _u = _req.url or ""
+            if ("job/readv2" in _u) or ("readv2job" in _u):
+                _captured.append(_u)
+
+        try:
+            self._sync_cookies_to_browser()
+            self.browser_context.on("request", _on_request)
+            _page = self.browser_context.new_page()
+            _url = ("https://mooc1.chaoxing.com/mooc-ans/knowledge/cards?"
+                    "clazzid=%s&courseid=%s&knowledgeid=%s&num=0&ut=s&cpi=%s&v=20160407-3&mooc2=1"
+                    % (_course["clazzId"], _course["courseId"], _kids[0], _course.get("cpi", "")))
+            _page.goto(_url, wait_until="domcontentloaded", timeout=30000)
+            _page.wait_for_timeout(4000)
+
+            _clicked = False
+            for _frame in list(getattr(_page, "frames", []) or []):
+                if "readv2job" not in (_frame.url or ""):
+                    continue
+                try:
+                    if _frame.evaluate("""() => {
+                            const el = document.querySelector('.readInfo') || document.querySelector('.readDivTitle');
+                            if (!el) return false;
+                            el.click();
+                            return true;
+                        }"""):
+                        _clicked = True
+                        break
+                except Exception:
+                    continue
+            if _clicked:
+                logger.trace("浏览器里已点开这一章的阅读任务，等待网页端上报...")
+            _page.wait_for_timeout(5000)
+            for _p in list(self.browser_context.pages):
+                if id(_p) in _before_ids or _p is _page:
+                    continue
+                try:
+                    _p.wait_for_timeout(1500)
+                except Exception:
+                    pass
+            if _captured:
+                logger.info("浏览器已上报阅读任务点")
+                return True
+            return _clicked
+        except Exception as e:
+            logger.debug(f"用浏览器打开阅读任务失败: {e}")
+            return False
+        finally:
+            try:
+                self.browser_context.remove_listener("request", _on_request)
+            except Exception:
+                pass
+            try:
+                for _p in list(self.browser_context.pages):
+                    if id(_p) in _before_ids:
+                        continue
+                    try:
+                        _p.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    def study_read(self, _course, _job, _job_info) -> StudyResult:
+        """阅读任务点（图书/资料）
+
+        网页端的完成方式（/ananas/modules/read/indexV2.html 里的 finishJob()）：
+            GET /mooc-ans/job/readv2?jobid=read-xxx&knowledgeid=..&courseid=..
+                &clazzid=..&jtoken=..&checkMicroTopic=true&microTopicId=0&courseEngineInfo=false
+        老代码用的是 /ananas/job/readv2（还少了 checkMicroTopic 等参数），
+        服务端只会回"无效的请求参数"，所以阅读任务点怎么都刷不掉。
+        """
+        _session = SessionManager.get_session()
+        _title = _job.get("title") or _job.get("name") or "阅读任务"
+
+        # 归档 / 预览状态：网页端自己也会直接 return（不提交）
+        if str((_job_info or {}).get("isFiled") or "0") == "1" or str((_job_info or {}).get("state") or "0") == "1":
+            logger.warning(f"阅读任务《{_title}》所在课程是归档/预览状态，网页端不会上报，跳过")
             return StudyResult.ERROR
 
-    # 兼容旧调用名
+        _jobids = self._read_jobid_candidates(_job) or [""]
+        _kids = self._read_knowledgeid_candidates(_job, _job_info) or [""]
+        _jtoken = self._read_jtoken(_job, _job_info)
+        _prop = _job.get("property") or {}
+        _micro = _job.get("microTopicId") or _prop.get("microTopicId") or 0
+        logger.info(f"正在完成阅读任务: {_title}（jobid={_jobids[0]}，knowledgeid={_kids[0]}）")
+
+        _base = {
+            "jobid": _jobids[0],
+            "knowledgeid": _kids[0],
+            "courseid": _course["courseId"],
+            "clazzid": _course["clazzId"],
+            "jtoken": _jtoken,
+        }
+        _full = dict(_base)
+        _full.update({"checkMicroTopic": "true", "microTopicId": _micro, "courseEngineInfo": "false"})
+        # 参数组合：先用网页端原样参数，再退化为不带额外参数、换 jobid 写法、老接口
+        _attempts = [
+            ("https://mooc1.chaoxing.com/mooc-ans/job/readv2", _full),
+            ("https://mooc1.chaoxing.com/mooc-ans/job/readv2", dict(_base)),
+        ]
+        if len(_jobids) > 1:
+            _alt = dict(_full)
+            _alt["jobid"] = _jobids[1]
+            _attempts.append(("https://mooc1.chaoxing.com/mooc-ans/job/readv2", _alt))
+        _attempts.append(("https://mooc1.chaoxing.com/ananas/job/readv2", dict(_base)))
+
+        _headers = {"Referer": "https://mooc1.chaoxing.com/mooc-ans/readv2job/preview"}
+        _last_msg = "未知"
+        for _url, _params in _attempts:
+            logger.trace(f"阅读上报尝试: {_url} 参数={_params}")
+            try:
+                _resp = _session.get(_url, params=_params, headers=_headers, timeout=15)
+            except Exception as e:
+                _last_msg = f"请求异常: {e}"
+                continue
+            _ok, _msg = self._read_judge(_resp)
+            if _ok:
+                logger.info(f"阅读任务学习 -> {_msg}")
+                return StudyResult.SUCCESS
+            _last_msg = _msg
+            logger.trace(f"阅读上报返回: {_msg}")
+
+        logger.warning(f"阅读任务《{_title}》接口上报没有成功（{_last_msg}）")
+        # 接口不行就交给浏览器：点开这一章的阅读任务，让网页端自己上报
+        # （同一次运行里同一个阅读任务最多开 2 次浏览器，避免收尾复查反复开页面）
+        if self._read_marked_passed(_course, _job, _job_info):
+            logger.info(f"阅读任务《{_title}》其实已经完成，继续下一个")
+            return StudyResult.SUCCESS
+        _bkey = str(_job.get("jobid") or _job.get("id") or _title)
+        if not hasattr(self, "_read_browser_tries"):
+            self._read_browser_tries = {}
+        _browser_ok = False
+        if self._read_browser_tries.get(_bkey, 0) < 2:
+            self._read_browser_tries[_bkey] = self._read_browser_tries.get(_bkey, 0) + 1
+            _browser_ok = self._read_open_in_browser(_course, _job, _job_info)
+
+        if self._read_marked_passed(_course, _job, _job_info):
+            logger.info(f"阅读任务《{_title}》已由网页端记录完成")
+            return StudyResult.SUCCESS
+        if _browser_ok:
+            logger.warning(f"阅读任务《{_title}》已在浏览器里点开，但没查到完成状态，收尾复查会再试一次")
+            return StudyResult.TIMEOUT
+        logger.error(f"阅读任务《{_title}》没能完成（接口和浏览器都没有成功）")
+        logger.warning("  如果这一章一直卡着，请在浏览器里打开这一章的阅读任务点，手动点一次「去阅读」")
+        return StudyResult.ERROR    # 兼容旧调用名
     def strdy_read(self, _course, _job, _job_info):
         return self.study_read(_course, _job, _job_info)
-
     # ==================== 问卷 ====================
     def study_vote(self, _course, _job, _job_info) -> None:
         """问卷调查任务"""

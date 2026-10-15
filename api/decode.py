@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import re
 import json
 from bs4 import BeautifulSoup
@@ -145,63 +145,98 @@ def decode_course_card(_text: str):
             "cardid": defaults.get("cardid"),
             "cpi": defaults.get("cpi"),
             "qnenc": defaults.get("qnenc"),
-            "knowledgeid": defaults.get("knowledgeid"),
+            "knowledgeid": defaults.get("knowledgeid") or defaults.get("knowledgeId"),
+            # 下面几个是阅读任务点上报 / 状态判断要用的（网页端 finishJob 用的就是这些）
+            "courseid": defaults.get("courseid") or defaults.get("courseId"),
+            "clazzId": defaults.get("clazzId"),
+            "userid": defaults.get("userid"),
+            "isFiled": defaults.get("isFiled"),
+            "state": defaults.get("state"),
         }
         attachments = _cards.get("attachments", [])
 
-        for _card in attachments:
+        for _card_index, _card in enumerate(attachments):
             if _card.get("isPassed"):
                 continue
 
-            card_type = _card.get("type")
+            card_type = str(_card.get("type") or "").strip().lower()
+            prop = _card.get("property") or {}
+            _title = prop.get("title") or prop.get("name") or _card.get("title") or ""
+            _otherinfo = _card.get("otherInfo") or ""
+            if "&courseId=" in _otherinfo:
+                _otherinfo = _otherinfo.split("&courseId=")[0]
 
-            # 处理非任务点（但直播任务即使 job=None 也应视为任务点）
-            if not _card.get("job") and card_type != "live":
-                # 阅读任务
-                if card_type == "read":
-                    prop = _card.get("property", {})
-                    pure_jobid = prop.get("id") or str(_card.get("jobid", "")).replace("read-", "") or ""
-                    _job = {
-                        "title": prop.get("title") or "阅读任务",
-                        "type": "read",
-                        "id": prop.get("id"),
-                        "jobid": pure_jobid,
-                        "jtoken": _card.get("jtoken"),
-                        "mid": _card.get("mid"),
-                        "otherinfo": _card.get("otherInfo", "").split('&courseId=')[0] if _card.get("otherInfo") else "",
-                        "enc": _card.get("enc"),
-                        "aid": _card.get("aid"),
-                    }
-                    _job_list.append(_job)
-                    continue
+            # 保险：个别章节的卡片没写 type，但 jobid 是 read-xxx，也按阅读处理
+            if not card_type:
+                _hint = str(_card.get("jobid") or "")
+                if _hint.lower().startswith("read"):
+                    card_type = "read"
 
-                # 问卷调查（vote）
-                if card_type == "vote":
-                    prop = _card.get("property", {})
-                    _job = {
-                        "title": prop.get("title") or "问卷调查",
-                        "type": "vote",
-                        "jobid": _card.get("jobid"),
-                        "otherinfo": _card.get("otherInfo", "").split('&courseId=')[0] if _card.get("otherInfo") else "",
-                        "mid": _card.get("mid"),
-                        "enc": _card.get("enc"),
-                        "aid": _card.get("aid"),
-                    }
-                    _job_list.append(_job)
-                    continue
+            # ==================== 阅读任务 ====================
+            # 和视频/作业一样：卡片里的 job 为真 = 这个任务点"还没完成"
+            # （实测：阅读任务点刷完后，同一张卡片的 job 会从 true 变成 null，
+            #   同时章节列表里的"待完成任务点"也会减 1）。
+            # 两个老坑：
+            #   1) 旧代码只在 "job 为空" 的分支里处理 read 卡片 —— 那正好是
+            #      "已完成"的卡片，等于专门跳过没完成的阅读任务点；
+            #   2) 旧代码看到 property.read == true 就当成"已阅读"跳过 ——
+            #      其实未完成的阅读卡片同样是 read=true，这个判断是错的。
+            if card_type == "read":
+                if not _card.get("job"):
+                    continue  # job 为空 = 服务端认为已完成，不用再刷
+                _read_id = prop.get("id") or _card.get("readId") or _card.get("objectId")
+                _card_jobid = _card.get("jobid")
+                if not _card_jobid and _read_id:
+                    _card_jobid = "read-%s" % _read_id
+                _job = {
+                    "title": _title or "阅读任务",
+                    "type": "read",
+                    "id": _read_id,
+                    "readid": _read_id,
+                    "jobid": _card_jobid or _read_id,
+                    "jtoken": _card.get("jtoken"),
+                    "mid": _card.get("mid"),
+                    "otherinfo": _otherinfo,
+                    "enc": _card.get("enc"),
+                    "aid": _card.get("aid"),
+                    "index": _card_index,
+                    "microTopicId": _card.get("microTopicId"),
+                    "property": prop,
+                }
+                _job_list.append(_job)
                 continue
 
-            # 视频任务
+            # ==================== 问卷调查（vote） ====================
+            if card_type == "vote":
+                _job = {
+                    "title": _title or "问卷调查",
+                    "type": "vote",
+                    "jobid": _card.get("jobid"),
+                    "otherinfo": _otherinfo,
+                    "mid": _card.get("mid"),
+                    "enc": _card.get("enc"),
+                    "aid": _card.get("aid"),
+                    "index": _card_index,
+                }
+                _job_list.append(_job)
+                continue
+
+            # 既没有 job 字段、也不是上面几种的卡片：不是任务点，跳过
+            if not _card.get("job") and card_type != "live":
+                continue
+
+            # ==================== 视频任务 ====================
             if card_type == "video":
-                prop = _card.get("property", {})
                 _job = {
                     "type": "video",
                     "jobid": _card.get("jobid"),
-                    "name": prop.get("name"),
-                    "otherinfo": _card.get("otherInfo", "").split('&courseId=')[0],
+                    "name": prop.get("name") or _title,
+                    "title": prop.get("name") or _title,
+                    "otherinfo": _otherinfo,
                     "mid": _card.get("mid"),
                     "objectid": _card.get("objectId"),
                     "aid": _card.get("aid"),
+                    "index": _card_index,
                 }
                 if not _job.get("mid"):
                     logger.warning("出现转码失败视频，已跳过...")
@@ -209,43 +244,46 @@ def decode_course_card(_text: str):
                 _job_list.append(_job)
                 continue
 
-            # document 任务
+            # ==================== document 任务 ====================
             if card_type == "document":
-                prop = _card.get("property", {})
                 _job = {
                     "type": "document",
                     "jobid": _card.get("jobid"),
-                    "otherinfo": _card.get("otherInfo", "").split('&courseId=')[0],
+                    "title": _title,
+                    "otherinfo": _otherinfo,
                     "jtoken": _card.get("jtoken"),
                     "mid": _card.get("mid"),
                     "enc": _card.get("enc"),
                     "aid": _card.get("aid"),
                     "objectid": prop.get("objectid"),
+                    "index": _card_index,
                 }
                 _job_list.append(_job)
                 continue
 
-            # workid 任务
+            # ==================== workid 任务 ====================
             if card_type == "workid":
                 _job = {
                     "type": "workid",
                     "jobid": _card.get("jobid"),
-                    "otherinfo": _card.get("otherInfo", "").split('&courseId=')[0],
+                    "title": _title,
+                    "otherinfo": _otherinfo,
                     "mid": _card.get("mid"),
                     "enc": _card.get("enc"),
                     "aid": _card.get("aid"),
+                    "index": _card_index,
                 }
                 _job_list.append(_job)
                 continue
 
-            # ==================== 直播任务（新增） ====================
+            # ==================== 直播任务 ====================
             if card_type == "live":
-                prop = _card.get("property", {}) or {}
                 _job = {
                     "type": "live",
                     "jobid": _card.get("jobid"),
                     "name": prop.get("title", prop.get("name", "未知直播")),
-                    "otherinfo": _card.get("otherInfo", "").split('&courseId=')[0] if _card.get("otherInfo") else "",
+                    "title": _title or "未知直播",
+                    "otherinfo": _otherinfo,
                     "mid": _card.get("mid", ""),
                     "enc": _card.get("enc", ""),
                     "aid": _card.get("aid", ""),
@@ -254,10 +292,15 @@ def decode_course_card(_text: str):
                     "liveId": prop.get("liveId"),
                     "streamName": prop.get("streamName"),
                     "vdoid": prop.get("vdoid"),
+                    "index": _card_index,
                 }
                 _job_list.append(_job)
                 continue
-            # ==========================================================
+
+            # ==================== 不认识的任务点：日志里说清楚，不要静默丢掉 ====================
+            if card_type:
+                logger.warning(f"遇到脚本暂不支持的任务点：类型={card_type}，标题={_title or '未知'}，"
+                               f"jobid={_card.get('jobid')}；已跳过，若它一直不完成请手动完成一次")
 
     return _job_list, _job_info
 

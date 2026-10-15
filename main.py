@@ -418,25 +418,27 @@ def fetch_job_list(chaoxing, course, knowledgeid, title="", retry_times=0, retry
     return jobs, job_info
 
 
-def process_jobs(chaoxing, course, jobs, job_info):
+def process_jobs(chaoxing, course, jobs, job_info, failed_jobs=None):
     """处理一个章节里的所有任务点（视频 / 文档 / 作业 / 阅读 / 问卷 / 直播）"""
     for job in jobs:
         if _stop_requested.is_set():
             logger.info("收到停止信号，中断刷课")
             return
 
-        logger.info(f"正在处理任务: {job.get('jobid', 'unknown')} - {job.get('title', job.get('name', 'unknown'))}")
+        _label = job.get("title") or job.get("name") or job.get("jobid") or "unknown"
+        logger.info(f"正在处理任务: {job.get('jobid', 'unknown')} - {_label}")
 
+        _result = None
         if job["type"] == "video":
-            chaoxing.study_video(course, job, job_info, _speed=1.0, _type="Video")
+            _result = chaoxing.study_video(course, job, job_info, _speed=1.0, _type="Video")
         elif job["type"] == "document":
-            chaoxing.study_document(course, job)
+            _result = chaoxing.study_document(course, job)
         elif job["type"] == "workid":
-            chaoxing.study_work(course, job, job_info)
+            _result = chaoxing.study_work(course, job, job_info)
         elif job["type"] == "read":
-            chaoxing.study_read(course, job, job_info)
+            _result = chaoxing.study_read(course, job, job_info)
         elif job["type"] == "vote":
-            chaoxing.study_vote(course, job, job_info)
+            _result = chaoxing.study_vote(course, job, job_info)
         elif job["type"] == "live":
             logger.info(f"识别到直播任务: {job.get('name', '未知直播')}")
             try:
@@ -449,6 +451,16 @@ def process_jobs(chaoxing, course, jobs, job_info):
                 LiveProcessor.run_live(live, speed=1.0)
             except Exception as e:
                 logger.error(f"处理直播任务时出错: {e}")
+
+        # 记录这个任务点的状态：这次没确认完成的留下来（收尾复查会重试、最后也会
+        # 明确告诉用户是哪一个）；前面失败过、这次成功的就从清单里去掉。
+        if _result is not None and hasattr(_result, "is_failure") and failed_jobs is not None:
+            _key = (str(job.get("type")), str(job.get("jobid")))
+            failed_jobs[:] = [_j for _j in failed_jobs
+                              if (str(_j.get("type")), str(_j.get("jobid"))) != _key]
+            if _result.is_failure():
+                logger.warning(f"任务《{_label}》（{job['type']}）这次没有确认完成（{_result.name}），收尾复查会再试一次")
+                failed_jobs.append(dict(job))
 
 
 def refresh_course_states(chaoxing, course, points):
@@ -534,6 +546,9 @@ def study_course(chaoxing, course, deepseek_tiku, settings):
 
     RB = RollBackManager(max_rollback)
     skipped_points = []          # 因未开放被跳过的章节 [(章节, 原因)]
+    _failed_jobs = []            # 这次没确认完成的任务点，最后统一提示
+    _stuck_points = []           # 显示未完成、但任务点接口什么都不返回的章节
+    _stuck_warned = set()
     _rechecked = set()           # 已经重新读过状态的章节，避免反复请求
     _last_handled = -2           # 上一次真正处理完（刷过或本来就没任务点）的章节下标
     __point_index = 0
@@ -618,7 +633,7 @@ def study_course(chaoxing, course, deepseek_tiku, settings):
             __point_index += 1
             continue
 
-        process_jobs(chaoxing, course, jobs, job_info)
+        process_jobs(chaoxing, course, jobs, job_info, _failed_jobs)
         # 任务点刷完后也点开一次章节页，让超星记录本章状态（闯关课程用来解锁下一章）
         visit_chapter(chaoxing, course, point, "任务点已处理完")
         _last_handled = __point_index
@@ -662,9 +677,19 @@ def study_course(chaoxing, course, deepseek_tiku, settings):
                     logger.info(f'补刷章节: {_p["title"]}')
                 else:
                     logger.info(f'复查章节《{_p["title"]}》：还有 {len(_jobs)} 个任务点没完成，再试一遍 ...')
-                process_jobs(chaoxing, course, _jobs, _info)
+                process_jobs(chaoxing, course, _jobs, _info, _failed_jobs)
             elif _p["id"] in _skipped_ids:
                 logger.info(f'补刷章节: {_p["title"]}（这一章没有任务点）')
+            else:
+                # 章节列表说"还没完成"，任务点接口却什么都没返回 —— 很可能是脚本
+                # 不认识/网页端才能完成的任务点（比如图书阅读），必须说清楚，
+                # 否则就是无声地在这里空转好几轮复查。
+                if _p["id"] not in _stuck_warned:
+                    _stuck_warned.add(_p["id"])
+                    logger.warning(f'章节《{_p["title"]}》显示未完成（章节进度 {_p.get("progress") or "?"}），'
+                                   f'但任务点接口没有返回任何待完成的任务点；'
+                                   f'可能是需要网页端才能完成的阅读任务点，请手动打开这一章确认一下')
+                _stuck_points.append(_p)
             visit_chapter(chaoxing, course, _p, "复查")
             skipped_points = [(p, r) for (p, r) in skipped_points if p["id"] != _p["id"]]
             progressed = True
@@ -717,7 +742,42 @@ def study_course(chaoxing, course, deepseek_tiku, settings):
         logger.warning("  最常见的是视频：服务端记录了播放进度却不判完成，后面的章节就一直解锁不了。")
         logger.warning("  建议：在浏览器里把这些视频正常播放完（别拖进度条），或者过一段时间再运行一次脚本")
         logger.warning("  （超星有时会延迟几十分钟到几小时才判定完成，你的 1.5.2 就是后来自己过的）。")
-    elif not skipped_points:
+        if any(str(_j.get("type")) == "read" for _p, _j in _unfinished):
+            logger.warning("  里面有阅读任务点：如果重跑还是它卡着，请在浏览器里把这一章的阅读任务点手动点开一次。")
+
+    if _stuck_points:
+        # 去重
+        _stuck_seen = set()
+        _stuck_unique = []
+        for _p in _stuck_points:
+            if _p["id"] in _stuck_seen:
+                continue
+            _stuck_seen.add(_p["id"])
+            _stuck_unique.append(_p)
+        logger.warning(f"注意：下面 {len(_stuck_unique)} 个章节显示没完成，但任务点接口里没有任何待完成的任务点：")
+        for _p in _stuck_unique[:10]:
+            logger.warning(f"    - 《{_p['title']}》（章节进度 {_p.get('progress') or '?'}）")
+        logger.warning("  这种一般是需要网页端才能完成的任务点（例如图书阅读），脚本上报不了。")
+        logger.warning("  建议：在浏览器里打开这几章，把里面那个阅读任务点手动点开/读完一次。")
+
+    # 没有"待复查的章节"了，但这次运行里曾经有任务点没确认完成（后来复查补上了）：软提示一下
+    if _failed_jobs and (not _unfinished) and (not _stuck_points):
+        _failed_seen = set()
+        _failed_unique = []
+        for _j in _failed_jobs:
+            _key = (_j.get("type"), str(_j.get("jobid")))
+            if _key in _failed_seen:
+                continue
+            _failed_seen.add(_key)
+            _failed_unique.append(_j)
+        _names = "、".join((_j.get("title") or _j.get("name") or str(_j.get("jobid")) or "未知任务")
+                          for _j in _failed_unique[:5])
+        logger.warning(
+            f"提示：这次运行里有 {len(_failed_unique)} 个任务点（{_names}…）出现过「没确认完成」的情况，"
+            f"复查时已经不在待办里了（一般就是服务端判定慢，后来自己过了）；"
+            f"如果网页上看着还是没完成，就手动处理一下这几个任务点。")
+
+    if (not _unfinished) and (not skipped_points) and (not _stuck_points):
         logger.info(f"课程《{course['title']}》所有章节已处理完成")
 
     return skipped_points
@@ -1046,7 +1106,7 @@ def main():
             print("\n已退出。")
             break
 
-        _lines = ["", "=" * 40, "超星学习通自动刷课脚本 v3.6",
+        _lines = ["", "=" * 40, "超星学习通自动刷课脚本 v3.7",
                   "提示: 退出请按 Ctrl+C（不要点窗口 X 按钮）", "=" * 40,
                   "1. 开始刷课"]
         if saved_user:
